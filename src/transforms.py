@@ -121,25 +121,45 @@ def compute_composition_errors(
     Both directed orderings ``(s0 -> I -> s1)`` and ``(s1 -> I -> s0)`` are
     computed and averaged. If ``per_sentence`` is True, returns per-sentence
     arrays (averaged across the two directions) instead of scalar means.
+
+    The implementation precomputes ``apply_transform(X_test[i], i, j)`` for
+    every ordered pair (20 applies). The per-(triple, intermediate) loop
+    then only needs the second leg of each indirect path — 60 additional
+    applies instead of the naive 180. ~56% fewer matmuls at high d.
     """
     if isinstance(X_test, list):
         X_test = {i: r for i, r in enumerate(X_test)}
+
+    # Precompute direct maps X_test[i] -> j for all i != j.
+    direct: dict[tuple[int, int], np.ndarray] = {}
+    for i in range(n_langs):
+        for j in range(n_langs):
+            if i != j:
+                direct[(i, j)] = apply_transform(X_test[i], i, j, transforms)
+
     out = {}
     for triple in combinations(range(n_langs), 3):
         triple_set = frozenset(triple)
         for intermediate in triple:
             others = [x for x in triple if x != intermediate]
             s0, s1 = others[0], others[1]
-            per_fwd = _per_sentence_ce(X_test[s0], s0, intermediate, s1, transforms)
-            per_rev = _per_sentence_ce(X_test[s1], s1, intermediate, s0, transforms)
+            # Forward: X[s0] -> intermediate -> s1
+            indirect_fwd = apply_transform(direct[(s0, intermediate)], intermediate, s1, transforms)
+            per_fwd = np.linalg.norm(indirect_fwd - direct[(s0, s1)], axis=1)
+            # Reverse: X[s1] -> intermediate -> s0
+            indirect_rev = apply_transform(direct[(s1, intermediate)], intermediate, s0, transforms)
+            per_rev = np.linalg.norm(indirect_rev - direct[(s1, s0)], axis=1)
             if per_sentence:
                 out[(triple_set, intermediate)] = 0.5 * (per_fwd + per_rev)
             else:
-                out[(triple_set, intermediate)] = 0.5 * (float(per_fwd.mean()) + float(per_rev.mean()))
+                out[(triple_set, intermediate)] = 0.5 * (
+                    float(per_fwd.mean()) + float(per_rev.mean())
+                )
     return out
 
 
 def _per_sentence_ce(x_src, src, inter, dst, transforms) -> np.ndarray:
+    """Legacy helper, kept for callers (e.g., Block B inline closure path)."""
     indirect = apply_transform(apply_transform(x_src, src, inter, transforms), inter, dst, transforms)
     direct = apply_transform(x_src, src, dst, transforms)
     return np.linalg.norm(indirect - direct, axis=1)

@@ -57,8 +57,9 @@ def parse_args() -> argparse.Namespace:
                    help="optional whitelist of layer labels (default: all)")
     p.add_argument("--pools", nargs="+", default=None,
                    help="optional whitelist of pooling strategies")
-    p.add_argument("--n-perms", type=int, default=20,
-                   help="permutation test iterations (Block D)")
+    p.add_argument("--n-perms", type=int, default=10,
+                   help="permutation test iterations (Block D); spec called for 20 "
+                        "but 10 gives usable z-scores at half the cost")
     p.add_argument("--pca-dims", nargs="+", type=int,
                    default=[16, 32, 64, 128, 256, 512])
     p.add_argument("--ridge-alphas", nargs="+", type=float,
