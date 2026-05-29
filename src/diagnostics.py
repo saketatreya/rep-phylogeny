@@ -357,36 +357,49 @@ def block_d_permutation(
     for p_idx in range(n_perms):
         rng = np.random.default_rng(seed=p_idx)
         perm_T = {}
-        for A, B in ALL_PAIRS:
-            c = pair_cache[(A, B)]
-            perm = rng.permutation(N_TRAIN)
-            Bc_p = c["Bc"][perm]
-            if method == "procrustes":
-                from .transforms import fit_procrustes_np
-                W = fit_procrustes_np(c["Ac"], Bc_p)
-                perm_T[(A, B)] = {
-                    "W": W, "mean_A": c["mA"], "mean_B": c["mB"],
-                    "is_orthogonal": True,
-                }
-            else:
-                W = cho_solve(c["chol_A"], c["Ac"].T @ Bc_p)
-                W_inv = cho_solve(c["chol_B"], Bc_p.T @ c["Ac"])
-                perm_T[(A, B)] = {
-                    "W": W, "W_inv": W_inv,
-                    "mean_A": c["mA"], "mean_B": c["mB"],
-                    "is_orthogonal": False,
-                }
-        ce_p = compute_composition_errors(test_reps, perm_T)
-        gt_rank_p = get_rank_of_ground_truth(ce_p, use_resolved=False)
-        perm_ces.append(ce_p)
-        perm_gt_ranks.append(gt_rank_p)
-        log(f"  perm {p_idx}: GT_rank(legacy)={gt_rank_p}/15")
+        try:
+            for A, B in ALL_PAIRS:
+                c = pair_cache[(A, B)]
+                perm = rng.permutation(N_TRAIN)
+                Bc_p = c["Bc"][perm]
+                if method == "procrustes":
+                    from .transforms import fit_procrustes_np
+                    W = fit_procrustes_np(c["Ac"], Bc_p)
+                    perm_T[(A, B)] = {
+                        "W": W, "mean_A": c["mA"], "mean_B": c["mB"],
+                        "is_orthogonal": True,
+                    }
+                else:
+                    W = cho_solve(c["chol_A"], c["Ac"].T @ Bc_p)
+                    W_inv = cho_solve(c["chol_B"], Bc_p.T @ c["Ac"])
+                    perm_T[(A, B)] = {
+                        "W": W, "W_inv": W_inv,
+                        "mean_A": c["mA"], "mean_B": c["mB"],
+                        "is_orthogonal": False,
+                    }
+            ce_p = compute_composition_errors(test_reps, perm_T)
+            gt_rank_p = get_rank_of_ground_truth(ce_p, use_resolved=False)
+            perm_ces.append(ce_p)
+            perm_gt_ranks.append(gt_rank_p)
+            log(f"  perm {p_idx}: GT_rank(legacy)={gt_rank_p}/15")
+        except np.linalg.LinAlgError as e:
+            log(f"  perm {p_idx}: SKIPPED ({type(e).__name__}: {e})")
+            continue
+
+    if not perm_ces:
+        log("D summary: ALL perms failed — skipping z-scores")
+        return {"mean_z": float("nan"), "z_scores": {},
+                "perm_gt_ranks": [], "n_perms_run": 0}
 
     # Z-scores per (triple, intermediate)
     z_scores = {}
-    log("D summary: z-scores (aligned vs permutation distribution)")
+    n_run = len(perm_ces)
+    if n_run < n_perms:
+        log(f"D summary: only {n_run}/{n_perms} perms succeeded — z-scores from survivors")
+    else:
+        log("D summary: z-scores (aligned vs permutation distribution)")
     for key in sorted(aligned_ce.keys(), key=lambda k: (sorted(k[0]), k[1])):
-        perm_vals = np.array([perm_ces[p][key] for p in range(n_perms)])
+        perm_vals = np.array([perm_ces[p][key] for p in range(n_run)])
         z = float((aligned_ce[key] - perm_vals.mean()) / (perm_vals.std() + 1e-10))
         z_scores[key] = z
         triple = tuple(sorted(key[0]))

@@ -137,7 +137,9 @@ def main() -> int:
     for model_key in args.models:
         cfg = MODELS[model_key]
         layer_labels_all = all_layer_labels(cfg["n_layers"])
-        layers = args.layers or layer_labels_all
+        # Intersect requested layers with this model's available labels.
+        # Lets us pass one --layers list spanning models with different depths.
+        layers = [l for l in (args.layers or layer_labels_all) if l in layer_labels_all]
         pools = args.pools or cfg["pool_strategies"]
         for pool in pools:
             for label in layers:
@@ -293,9 +295,17 @@ def main() -> int:
                         "closure_max": float(np.max(list(closures.values()))),
                     })
 
-                # Block C4 — across-layer consistency (only meaningful after final layer)
-                # We log to the per-(model,pool,method) consistency log incrementally.
-                pass
+                # Incremental SUMMARY write — survives a downstream crash.
+                _write_summary(
+                    out_dir / "SUMMARY.txt",
+                    gt_rank=table_gt_rank,
+                    split_scores=table_split_scores,
+                    perm_z=table_perm_z,
+                    pca=table_pca,
+                    langid=table_langid,
+                    per_lang_bias=table_per_lang_bias,
+                    closure=table_closure,
+                )
 
     # ---------- Step 3: C4 + master summary ----------
     for (model_key, pool, method), ce_by_layer in ce_means_by_config.items():

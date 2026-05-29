@@ -23,7 +23,13 @@ ALL_PAIRS = list(combinations(range(5), 2))
 def fit_procrustes_np(X_A: np.ndarray, X_B: np.ndarray) -> np.ndarray:
     """Closed-form orthogonal Procrustes in float64. Inputs already centered."""
     M = X_A.astype(np.float64, copy=False).T @ X_B.astype(np.float64, copy=False)
-    U, _, Vt = svd(M, full_matrices=False)
+    try:
+        U, _, Vt = svd(M, full_matrices=False, lapack_driver="gesdd")
+    except np.linalg.LinAlgError:
+        # gesdd's divide-and-conquer can fail to converge on ill-structured
+        # matrices (e.g. deep Gemma layers with activation outliers, post-
+        # permutation). gesvd is slower but uses QR and almost always converges.
+        U, _, Vt = svd(M, full_matrices=False, lapack_driver="gesvd")
     return U @ Vt
 
 
