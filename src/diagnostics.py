@@ -152,16 +152,20 @@ def block_b_transform_stats(
     recon_train_table = {}
     recon_test_table = {}
     for A, B in ALL_PAIRS:
-        W = transforms[(A, B)]["W"]
+        t = transforms[(A, B)]
+        W = t["W"]
         dist_I = float(np.linalg.norm(W - I, "fro"))
         tr = float(np.trace(W))
-        try:
-            S_W = np.linalg.svd(W, compute_uv=False)
-            sv_min = float(S_W.min())
-            sv_max = float(S_W.max())
-            cond = sv_max / (sv_min + 1e-30)
-        except np.linalg.LinAlgError:
-            sv_min = sv_max = cond = float("nan")
+        if t.get("is_orthogonal", False):
+            sv_min = sv_max = cond = 1.0
+        else:
+            try:
+                S_W = np.linalg.svd(W, compute_uv=False)
+                sv_min = float(S_W.min())
+                sv_max = float(S_W.max())
+                cond = sv_max / (sv_min + 1e-30)
+            except np.linalg.LinAlgError:
+                sv_min = sv_max = cond = float("nan")
         log(
             f"  W({LANGS[A]},{LANGS[B]}): ||W-I||_F={dist_I:.4f}  "
             f"trace={tr:.4f}/{d}  sv=[{sv_min:.4f},{sv_max:.4f}]  cond={cond:.4f}"
@@ -231,8 +235,8 @@ def block_c_composition(
     """C1 distribution stats; C2 within-triple ranking; C3 per-lang bias."""
     log("--- BLOCK C: composition errors ---")
     test_reps = [r[N_TRAIN:].astype(np.float64) for r in reps]
-    ce_mean = compute_composition_errors(test_reps, transforms)
     ce_per_sent = compute_composition_errors(test_reps, transforms, per_sentence=True)
+    ce_mean = {k: float(v.mean()) for k, v in ce_per_sent.items()}
 
     log("C1: per (triple, intermediate) mean/std/median")
     for triple in ALL_TRIPLES:
@@ -320,34 +324,56 @@ def block_d_permutation(
     """Permutation test: misalign training sentences within each pair, refit
     transforms, recompute composition errors on aligned test data, score
     topologies, and report z-scores.
+
+    For ridge, the Gram matrices ``Ac.T @ Ac + αI`` and ``Bc.T @ Bc + αI`` are
+    permutation-invariant (Bc differs only by a row permutation, which leaves
+    its Gram unchanged) so we Cholesky-factor them once per pair and reuse
+    across all perms. Only the right-hand sides ``Ac.T @ Bc_perm`` and
+    ``Bc_perm.T @ Ac`` change per perm.
     """
+    from scipy.linalg import cho_factor, cho_solve
     log(f"--- BLOCK D: permutation test (n={n_perms}, method={method}) ---")
 
     test_reps = [r[N_TRAIN:].astype(np.float64) for r in reps]
+
+    # Pre-cache per-pair constants (means, centered matrices, optionally Gram factors).
+    pair_cache: dict[tuple[int, int], dict] = {}
+    for A, B in ALL_PAIRS:
+        XA = reps[A][:N_TRAIN].astype(np.float64)
+        XB = reps[B][:N_TRAIN].astype(np.float64)
+        mA = XA.mean(axis=0)
+        mB = XB.mean(axis=0)  # permutation-invariant
+        Ac = XA - mA
+        Bc = XB - mB
+        entry = {"mA": mA, "mB": mB, "Ac": Ac, "Bc": Bc}
+        if method == "ridge":
+            d = Ac.shape[1]
+            entry["chol_A"] = cho_factor(Ac.T @ Ac + ridge_alpha * np.eye(d), lower=True)
+            entry["chol_B"] = cho_factor(Bc.T @ Bc + ridge_alpha * np.eye(d), lower=True)
+        pair_cache[(A, B)] = entry
+
     perm_ces = []
     perm_gt_ranks = []
     for p_idx in range(n_perms):
         rng = np.random.default_rng(seed=p_idx)
         perm_T = {}
         for A, B in ALL_PAIRS:
-            XA = reps[A][:N_TRAIN].astype(np.float64)
-            XB = reps[B][:N_TRAIN].astype(np.float64)
+            c = pair_cache[(A, B)]
             perm = rng.permutation(N_TRAIN)
-            XB_p = XB[perm]
-            mA = XA.mean(axis=0)
-            mB = XB_p.mean(axis=0)
-            Ac = XA - mA
-            Bc = XB_p - mB
+            Bc_p = c["Bc"][perm]
             if method == "procrustes":
                 from .transforms import fit_procrustes_np
-                W = fit_procrustes_np(Ac, Bc)
-                perm_T[(A, B)] = {"W": W, "mean_A": mA, "mean_B": mB, "is_orthogonal": True}
-            else:
-                from .transforms import fit_ridge_np
-                W = fit_ridge_np(Ac, Bc, alpha=ridge_alpha)
-                W_inv = fit_ridge_np(Bc, Ac, alpha=ridge_alpha)
+                W = fit_procrustes_np(c["Ac"], Bc_p)
                 perm_T[(A, B)] = {
-                    "W": W, "W_inv": W_inv, "mean_A": mA, "mean_B": mB,
+                    "W": W, "mean_A": c["mA"], "mean_B": c["mB"],
+                    "is_orthogonal": True,
+                }
+            else:
+                W = cho_solve(c["chol_A"], c["Ac"].T @ Bc_p)
+                W_inv = cho_solve(c["chol_B"], Bc_p.T @ c["Ac"])
+                perm_T[(A, B)] = {
+                    "W": W, "W_inv": W_inv,
+                    "mean_A": c["mA"], "mean_B": c["mB"],
                     "is_orthogonal": False,
                 }
         ce_p = compute_composition_errors(test_reps, perm_T)
@@ -449,22 +475,39 @@ def block_e_scoring(
 
 # ---------- Block F: PCA sweep ----------
 
+def compute_pooled_pca(reps: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    """One pooled SVD per (model, pool, layer). Reused across methods.
+
+    Returns (S_pca, Vt_pca) for the per-language-centered training pool.
+    """
+    pooled = np.vstack([
+        reps[L][:N_TRAIN].astype(np.float64) - reps[L][:N_TRAIN].astype(np.float64).mean(axis=0)
+        for L in range(5)
+    ])
+    _, S_pca, Vt_pca = svd(pooled, full_matrices=False)
+    return S_pca, Vt_pca
+
+
 def block_f_pca_sweep(
     reps: list[np.ndarray],
     method: str,
     ridge_alpha: float,
     target_dims: list[int],
     log: Callable[[str], None],
+    pooled_svd: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> dict:
     """For each d', project all reps onto the top-d' principal axes of the
     pooled per-language-centered training data, refit, rescore.
+
+    ``pooled_svd``: optional precomputed (S_pca, Vt_pca) from
+    :func:`compute_pooled_pca`. Pass the same tuple for both procrustes and
+    ridge runs of the same layer to avoid recomputing the SVD.
     """
     log(f"--- BLOCK F: PCA sweep ({target_dims}) ---")
-    pooled = np.vstack([
-        reps[L][:N_TRAIN].astype(np.float64) - reps[L][:N_TRAIN].astype(np.float64).mean(axis=0)
-        for L in range(5)
-    ])
-    _, S_pca, Vt_pca = svd(pooled, full_matrices=False)
+    if pooled_svd is None:
+        S_pca, Vt_pca = compute_pooled_pca(reps)
+    else:
+        S_pca, Vt_pca = pooled_svd
     log(f"  pooled-centered top singular values: {np.array2string(S_pca[:8], precision=2)}")
 
     results = {}
@@ -522,15 +565,17 @@ def block_g_langid(
 ) -> dict:
     """Project out the top k lang-ID directions before fitting transforms."""
     log("--- BLOCK G: language-ID projection sweep ---")
-    d = reps[0].shape[1]
     results = {}
     for k in range(5):
         if k == 0:
             proj = [r.astype(np.float64).copy() for r in reps]
         else:
+            # Apply I - V.T V via (r - (r @ V.T) @ V) — O(n d k) instead of O(n d^2).
             V = langid_basis[:k].astype(np.float64)
-            P = np.eye(d) - V.T @ V
-            proj = [r.astype(np.float64) @ P for r in reps]
+            proj = []
+            for r in reps:
+                r64 = r.astype(np.float64)
+                proj.append(r64 - (r64 @ V.T) @ V)
         T = fit_all_transforms(proj, method=method, ridge_alpha=ridge_alpha)
         test_proj = [p[N_TRAIN:] for p in proj]
         ce_g = compute_composition_errors(test_proj, T)

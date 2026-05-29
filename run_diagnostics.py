@@ -153,6 +153,11 @@ def main() -> int:
                 a_out = D.block_a_representation_stats(X_all, log=a_lines.append)
                 (cfg_dir / "block_a.log").write_text("\n".join(a_lines))
 
+                # Pooled PCA SVD — computed once per layer, reused across methods
+                pooled_svd = None
+                if not args.no_pca:
+                    pooled_svd = D.compute_pooled_pca(X_all)
+
                 for method in args.methods:
                     print(f"  --- method={method} ---")
                     m_lines: list[str] = []
@@ -205,7 +210,7 @@ def main() -> int:
                     else:
                         d_out = {"mean_z": float("nan"), "perm_gt_ranks": []}
 
-                    # Block F — PCA sweep
+                    # Block F — PCA sweep (pooled SVD precomputed once per layer)
                     if not args.no_pca:
                         f_out = D.block_f_pca_sweep(
                             X_all,
@@ -213,6 +218,7 @@ def main() -> int:
                             ridge_alpha=alpha,
                             target_dims=args.pca_dims,
                             log=log,
+                            pooled_svd=pooled_svd,
                         )
                     else:
                         f_out = {}
