@@ -1,117 +1,51 @@
-# rep-phylogeny
+# Genealogy over surface
 
-**Can the composition error of Procrustes maps between language representations
-recover a known phylogenetic tree?**
+Spec: [`new_spec.md`](new_spec.md). Three escalating gates:
 
-One model, five Romance languages, one number: the rank of the consensus
-linguistic tree among all 15 possible unrooted binary topologies on 5 taxa.
-
-If the correct topology lands at rank 1–2 on either of the two models we try,
-the research direction is viable.
-
-Full spec: [`experiment.md`](experiment.md).
-
----
-
-## What's happening
-
-1. **Extract** mean-pooled hidden states from a multilingual LM for the same
-   1012 FLORES-200 sentences in each of 5 languages, at 4 layer depths.
-2. **Fit** an orthogonal Procrustes map for each of the 10 language pairs on
-   812 training sentences.
-3. **Compose** maps two ways for each ordered triple `(A, B, C)` —
-   direct `A→C` vs. indirect `A→B→C` — and measure the L2 mismatch on 200
-   held-out test sentences. This yields 30 composition errors.
-4. **Score** all 15 topologies. A topology predicts which intermediates
-   should compose well (the ingroup) and which shouldn't (the outgroup).
-   The topology whose ingroups give the lowest summed composition error
-   wins.
-5. **Compare** the winning topology to the consensus Romance tree.
-
-| Models | Layers |
-|---|---|
-| `xlm-roberta-large` (560M, encoder) | 6, 12, 18, 23 |
-| `google/gemma-2-2b` (2.6B, decoder, gated) | 6, 13, 19, 25 |
-
----
-
-## Run on Kaggle (recommended)
-
-1. Create a notebook with **GPU T4 x2** as the accelerator.
-2. Open `kaggle_notebook.ipynb` from this repo (or copy the cells from it).
-3. (For Gemma-2) Add an `HF_TOKEN` Kaggle Secret and accept the
-   [Gemma-2 license](https://huggingface.co/google/gemma-2-2b).
-4. Run all cells.
-
-Total runtime: **≈ 10–15 minutes** on T4.
-
-Combined report written to `/kaggle/working/results/report.txt`.
-
-## Run locally
-
-```bash
-pip install -r requirements.txt
-python run.py                          # both models, 4 layers each
-python run.py --models xlm-roberta-large
-python run.py --skip-extract           # reuse cached .npy reps
-```
-
-## Verify the math
-
-```bash
-python tests/test_pipeline.py
-```
-
-7 synthetic checks with no GPU/model required. With the planted
-Romance-like structure, the ground-truth topology lands at rank ≤ 2.
-
----
+- **Tier 0:** Atomic flip on {English, German, French}. One sign.
+- **Tier 1:** Held-out family discriminant. English overrides its surface
+  similarity to French and classifies as Germanic.
+- **Tier 2:** Single inherited-vs-borrowed axis transferring across families
+  (English ↔ Germanic, Maltese ↔ Semitic, Urdu ↔ Indo-Aryan, Romanian ↔
+  Romance).
 
 ## Layout
 
 ```
 src/
-  config.py            languages, layer indices, model registry
-  data.py              FLORES-200 loader (3-source fallback)
-  representations.py   model forward pass, layer-wise mean pooling
-  procrustes.py        orthogonal Procrustes + transform
-  composition.py       30 composition errors
-  topologies.py        15 unrooted topologies + scoring
-  report.py            ranking table + sanity checks
-run.py                 CLI driver
-tests/test_pipeline.py synthetic smoke test
-kaggle_notebook.ipynb  Kaggle entry point
-experiment.md          full spec
+  config.py         language set (25 langs), model + sweep grid
+  data.py           FLORES-200 tarball loader (generic over codes)
+  representations.py extraction: mean-pool + high-frequency-token pool
+  surface.py        char n-gram TF-IDF distance (with romanization helper)
+  hub.py            generalized orthogonal Procrustes
+  geometry.py       Procrustes residual + hub centroid distances
+  classify.py       LDA family discriminant + axis projection
+  tree.py           NJ + Newick + bootstrap clade support + Mantel
+  bootstrap.py      test-sentence resampling helpers
+run_extract.py      GPU stage — one-shot per model
+run_tier0.py        atomic flip table
+run_tier1.py        held-out discriminant
+run_tier2.py        full sweep (clade support, axis transfer, Mantel, translit)
+kaggle_notebook.ipynb  orchestrates extraction + all tiers
 ```
 
-## Decision criteria
+## Run
 
-| Outcome | Verdict |
-|---|---|
-| Ground-truth rank 1 in any config | Strong signal — proceed |
-| Ground-truth rank 1–3 in most configs | Viable |
-| Ground-truth rank 4–7 consistently | Ambiguous |
-| Ground-truth rank 8+ everywhere | Not viable — stop |
+**Kaggle (GPU):** open `kaggle_notebook.ipynb`, run all. Outputs land in
+`/kaggle/working/results/`; the final cell zips them.
 
----
+**Local CPU (Tier 0 only, after extraction exists locally):**
+```
+python run_tier0.py --reps-dir results/reps --out-dir results
+```
 
-## Notes on spec resolution
+Bootstrap and clade-support stages need `results/reps/` populated by
+`run_extract.py`. Local extraction with all 25 languages and 24 layers is
+feasible on CPU but slow (~hours); use Kaggle for the full sweep.
 
-A few things in `experiment.md` were ambiguous or wrong; resolved here as:
+## Outputs
 
-- **`itertools-more`** in the pip install — not a real package; dropped
-  (only stdlib `itertools.combinations` is used).
-- **FLORES dataset path** — `facebook/flores` is not always available;
-  loader falls back across `facebook/flores → openlanguagedata/flores_plus →
-  Muennighoff/flores200`.
-- **Gemma-2 auth** — the spec doesn't mention that Gemma-2-2b is gated;
-  it requires an HF token with the license accepted.
-- **Rooted vs. unrooted outgroups** — the spec's outgroup table (lines
-  430–441 of `experiment.md`) reflects the *rooted* tree
-  `((((Spa,Por),Fre),Ita),Ron)`. When unrooted into the two splits
-  `{0,1}|{2,3,4}` and `{0,1,2}|{3,4}`, the resulting tree has `(Ita,Ron)`
-  as a cherry, so the split-based per-triple outgroup disagrees with the
-  rooted-view outgroup on triples that cross the central edge. Since the
-  algorithm scores **unrooted** topologies, it uses the split-based
-  outgroup (matching the spec's `get_outgroup` function); the ground-truth
-  topology is identified by its splits, not the rooted outgroup table.
+Read `results/SUMMARY.txt` top-to-bottom — it's the decision table.
+Per-tier CSVs (`tier0_atomic.csv`, `tier1_heldout.csv`,
+`tier2a_clade_support_*.csv`, …) carry the full numbers. NJ trees go to
+`results/trees/*.nwk`.

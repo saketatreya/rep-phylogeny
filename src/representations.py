@@ -1,164 +1,164 @@
-"""Extract pooled hidden states at every transformer layer for each language.
+"""Extract per-layer pooled hidden states for an arbitrary language set.
 
-Two pooling strategies are supported:
-- ``mean_pool``: mean over content tokens (excluding BOS/CLS and EOS/SEP/pad).
-- ``last_token``: hidden state at the last non-special content position.
+Two pool strategies (both computed in one pass to amortize the forward):
 
-For ``xlm-roberta-large`` (bidirectional encoder), only ``mean_pool`` is run.
-For ``google/gemma-2-2b`` (decoder LM), both strategies are extracted.
+- ``mean_pool``: mean over all non-special content tokens.
+- ``high_freq``: mean restricted to the per-language top-K most frequent
+  subword ids (HIGH_FREQ_K in config). Targets the borrowing-resistant
+  grammatical core (function words / morphology), per Rabinovich et al. 2017.
 
 Storage layout::
 
-    {out_dir}/{model_key}/{pool_strategy}/layer_KK/{lang_name}.npy
-        shape (n_sentences, d_model), dtype float32
+    {out_dir}/{model_key}/{pool}/layer_KK/{lang_name}.npy
+        shape (1012, d_model), dtype float32
 
-Note: hidden_states[k+1] is the output of transformer block k, where k is
-0-indexed. hidden_states[0] is the embedding output. So `layer_00` =
-hidden_states[1], ..., `layer_NN` = hidden_states[n_layers].
+`layer_KK` = output of transformer block K (0-indexed). `hidden_states[0]` is
+the embedding output, so `layer_KK` = `hidden_states[K+1]`.
 """
 from __future__ import annotations
 import gc
+from collections import Counter
 from pathlib import Path
+
 import numpy as np
-import torch
-from tqdm import tqdm
 
-from .config import LANG_NAMES, MODELS, all_layer_labels
+from .config import HIGH_FREQ_K, MODELS, all_layer_labels
 
 
-_DTYPE_MAP = {
-    "float16": torch.float16,
-    "float32": torch.float32,
-    "bfloat16": torch.bfloat16,
-}
+# torch is only needed for extraction; load_reps below uses only numpy. Lazy
+# imports so the analysis scripts can use load_reps without a torch install.
 
 
-@torch.no_grad()
+def _compute_high_freq_ids(
+    tokenizer, sentences: list[str], k: int, special_ids: set[int],
+) -> set[int]:
+    """Top-K most frequent non-special subword ids across all sentences."""
+    counts: Counter[int] = Counter()
+    for s in sentences:
+        ids = tokenizer(s, add_special_tokens=False)["input_ids"]
+        counts.update(ids)
+    for sid in special_ids:
+        counts.pop(sid, None)
+    return {tid for tid, _ in counts.most_common(k)}
+
+
 def extract_for_model(
     model_key: str,
-    sentences_per_lang: list[list[str]],
+    sentences_per_lang: dict[str, list[str]],
     out_dir: Path,
+    pool_strategies: tuple[str, ...] = ("mean_pool", "high_freq"),
     batch_size: int | None = None,
     max_length: int = 256,
     device: str | None = None,
-    pool_strategies: list[str] | None = None,
     sanity_log: list[str] | None = None,
 ) -> None:
-    """Run a model on all 5 languages × all sentences, save per-layer pooled
-    vectors for every transformer layer and every requested pooling strategy.
-    """
+    import torch
+    from tqdm import tqdm
     from transformers import AutoModel, AutoTokenizer
 
+    _DTYPE = {"float16": torch.float16, "float32": torch.float32,
+              "bfloat16": torch.bfloat16}
+
     cfg = MODELS[model_key]
-    hf_id = cfg["hf_id"]
-    is_decoder = cfg["is_decoder"]
-    n_layers_expected = cfg["n_layers"]
     if batch_size is None:
         batch_size = cfg.get("batch_size", 16)
-    if pool_strategies is None:
-        pool_strategies = list(cfg["pool_strategies"])
-
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
-
     cfg_dtype = cfg.get("dtype", "float16" if device == "cuda" else "float32")
     if device == "cpu":
-        cfg_dtype = "float32"  # fp16 on CPU is pointless and slow
-    dtype = _DTYPE_MAP[cfg_dtype]
+        cfg_dtype = "float32"
+    dtype = _DTYPE[cfg_dtype]
 
-    print(f"\n[{model_key}] loading from {hf_id} (dtype={cfg_dtype}, pool={pool_strategies})")
-    tokenizer = AutoTokenizer.from_pretrained(hf_id)
+    print(f"\n[{model_key}] loading from {cfg['hf_id']} "
+          f"(dtype={cfg_dtype}, pool={list(pool_strategies)})")
+    tokenizer = AutoTokenizer.from_pretrained(cfg["hf_id"])
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model_kwargs = dict(torch_dtype=dtype, output_hidden_states=True)
-    if is_decoder:
-        # Gemma-2 needs eager attention to expose hidden states reliably on
-        # Kaggle's transformers version.
-        model_kwargs["attn_implementation"] = "eager"
-    model = AutoModel.from_pretrained(hf_id, **model_kwargs)
-    model.to(device)
-    model.eval()
+    model = AutoModel.from_pretrained(
+        cfg["hf_id"], torch_dtype=dtype, output_hidden_states=True,
+    )
+    model.to(device).eval()
 
-    n_layers_actual = model.config.num_hidden_layers
-    if n_layers_actual != n_layers_expected:
-        print(f"  [warn] expected {n_layers_expected} layers, got {n_layers_actual} — using actual.")
-    labels = all_layer_labels(n_layers_actual)
-    print(f"  layers: {len(labels)} ({labels[0]} .. {labels[-1]})")
+    n_layers = model.config.num_hidden_layers
+    labels = all_layer_labels(n_layers)
+    d = model.config.hidden_size
+    print(f"  layers: {len(labels)} ({labels[0]}..{labels[-1]})  d_model={d}")
 
-    eos_id = tokenizer.sep_token_id if tokenizer.sep_token_id is not None else tokenizer.eos_token_id
+    special_ids = set(tokenizer.all_special_ids)
 
     out_dir = Path(out_dir)
-    model_dir = out_dir / model_key
     for pool in pool_strategies:
-        for label in labels:
-            (model_dir / pool / label).mkdir(parents=True, exist_ok=True)
+        for lab in labels:
+            (out_dir / model_key / pool / lab).mkdir(parents=True, exist_ok=True)
 
-    d = model.config.hidden_size
-
-    for lang_idx, sents in enumerate(sentences_per_lang):
-        lang_name = LANG_NAMES[lang_idx]
+    for lang_name, sents in sentences_per_lang.items():
         n = len(sents)
-        # Per-pool, per-layer output buffers
-        pooled: dict[str, dict[str, np.ndarray]] = {
-            pool: {label: np.zeros((n, d), dtype=np.float32) for label in labels}
-            for pool in pool_strategies
+
+        # Per-language top-K ids for the high_freq pool. Cheap (one tokenizer pass).
+        hf_ids: set[int] = set()
+        if "high_freq" in pool_strategies:
+            hf_ids = _compute_high_freq_ids(tokenizer, sents, HIGH_FREQ_K, special_ids)
+            print(f"  [{lang_name}] high_freq vocab = {len(hf_ids)} token ids")
+
+        pooled = {
+            p: {lab: np.zeros((n, d), dtype=np.float32) for lab in labels}
+            for p in pool_strategies
         }
 
-        pbar = tqdm(range(0, n, batch_size), desc=f"  {lang_name:<10}")
+        pbar = tqdm(range(0, n, batch_size), desc=f"  {lang_name:<5}")
         for start in pbar:
             end = min(start + batch_size, n)
             batch = sents[start:end]
-            enc = tokenizer(
-                batch,
-                padding=True,
-                truncation=True,
-                max_length=max_length,
-                return_tensors="pt",
-            ).to(device)
+            enc = tokenizer(batch, padding=True, truncation=True,
+                            max_length=max_length, return_tensors="pt").to(device)
 
-            out = model(**enc)
-            hidden_states = out.hidden_states  # tuple length n_layers+1
+            with torch.no_grad():
+                out = model(**enc)
+            hidden_states = out.hidden_states  # tuple of length n_layers+1
 
-            attn = enc["attention_mask"].clone()  # (B, T)
-            ids = enc["input_ids"]
-            attn[:, 0] = 0  # drop BOS / CLS
-            if eos_id is not None:
-                eos_mask = (ids == eos_id)
-                attn = attn * (~eos_mask).to(attn.dtype)
-            content_mask = attn.unsqueeze(-1).float()  # (B, T, 1)
-            content_count = content_mask.sum(dim=1).clamp_min(1.0)  # (B, 1)
+            ids = enc["input_ids"]                  # (B, T)
+            attn = enc["attention_mask"].clone()    # (B, T)
+            # Drop ALL special tokens (BOS, EOS, pad, mask, etc.) from content mask.
+            for sid in special_ids:
+                attn = attn * (ids != sid).to(attn.dtype)
 
-            # Precompute last-content-token index per row (for last_token pool).
-            if "last_token" in pool_strategies:
-                row_sums = attn.sum(dim=1)  # (B,)
-                # For each row, find the last position where attn==1.
-                # If all zero (shouldn't happen), fall back to position 1.
-                last_idx = torch.zeros(attn.shape[0], dtype=torch.long, device=device)
-                for i in range(attn.shape[0]):
-                    nz = torch.nonzero(attn[i], as_tuple=False).flatten()
-                    last_idx[i] = nz[-1].item() if nz.numel() > 0 else 1
+            content_mask = attn.unsqueeze(-1).float()      # (B, T, 1)
+            content_count = content_mask.sum(dim=1).clamp_min(1.0)
 
-            for k, label in enumerate(labels):
-                hs = hidden_states[k + 1].float()  # (B, T, d) in fp32 for pooling
+            if "high_freq" in pool_strategies and hf_ids:
+                hf_id_tensor = torch.tensor(list(hf_ids), device=device)
+                # (B, T): True at positions whose token id is in the per-lang top-K
+                hf_pos = torch.isin(ids, hf_id_tensor) & (attn > 0)
+                hf_mask = hf_pos.unsqueeze(-1).float()
+                hf_count = hf_mask.sum(dim=1).clamp_min(1.0)
+                # Sentences with zero matches fall back to plain mean (rare with K=80
+                # — function words land in nearly every sentence).
+                hf_fallback = (hf_pos.sum(dim=1) == 0)  # (B,)
+
+            for k, lab in enumerate(labels):
+                hs = hidden_states[k + 1].float()  # (B, T, d) in fp32 for stable pool
+
                 if "mean_pool" in pool_strategies:
-                    pooled_batch = (hs * content_mask).sum(dim=1) / content_count  # (B, d)
-                    pooled["mean_pool"][label][start:end] = pooled_batch.cpu().numpy()
-                if "last_token" in pool_strategies:
-                    rows = torch.arange(hs.shape[0], device=device)
-                    last_batch = hs[rows, last_idx]  # (B, d)
-                    pooled["last_token"][label][start:end] = last_batch.cpu().numpy()
+                    mp = (hs * content_mask).sum(dim=1) / content_count
+                    pooled["mean_pool"][lab][start:end] = mp.cpu().numpy()
+
+                if "high_freq" in pool_strategies and hf_ids:
+                    hp = (hs * hf_mask).sum(dim=1) / hf_count
+                    if hf_fallback.any():
+                        mp_fb = (hs * content_mask).sum(dim=1) / content_count
+                        hp = torch.where(hf_fallback.unsqueeze(-1), mp_fb, hp)
+                    pooled["high_freq"][lab][start:end] = hp.cpu().numpy()
 
             del out, hidden_states
 
-        for pool in pool_strategies:
-            for label, arr in pooled[pool].items():
-                path = model_dir / pool / label / f"{lang_name}.npy"
-                np.save(path, arr)
+        for p in pool_strategies:
+            for lab, arr in pooled[p].items():
+                np.save(out_dir / model_key / p / lab / f"{lang_name}.npy", arr)
         print(f"  saved {lang_name}: {len(labels)} layers × {len(pool_strategies)} pool(s)")
 
-    # Inline sanity checks (norms + Spa-Por/Fre/Ron cosine per layer).
-    _emit_sanity_checks(model_key, model_dir, pool_strategies, labels, sanity_log)
+    _emit_sanity(model_key, out_dir, list(pool_strategies), labels,
+                 list(sentences_per_lang.keys()), sanity_log)
 
     del model, tokenizer
     gc.collect()
@@ -166,65 +166,27 @@ def extract_for_model(
         torch.cuda.empty_cache()
 
 
-def _emit_sanity_checks(
-    model_key: str,
-    model_dir: Path,
-    pool_strategies: list[str],
-    labels: list[str],
-    sanity_log: list[str] | None,
-) -> None:
-    def emit(msg: str) -> None:
+def _emit_sanity(model_key, out_dir, pools, labels, lang_names, sanity_log) -> None:
+    def emit(msg):
         print(msg)
         if sanity_log is not None:
             sanity_log.append(msg)
 
     emit("")
     emit(f"=== sanity checks: {model_key} ===")
-    for pool in pool_strategies:
-        for label in labels:
-            reps = []
-            for name in LANG_NAMES:
-                reps.append(np.load(model_dir / pool / label / f"{name}.npy"))
-
-            # Norm stats per language
-            for L, name in enumerate(LANG_NAMES):
-                ns = np.linalg.norm(reps[L], axis=1)
-                emit(
-                    f"  {model_key}:{pool}:{label}:{name[:3]}: "
-                    f"mean_norm={ns.mean():.2f}  std={ns.std():.2f}  "
-                    f"min={ns.min():.2f}  max={ns.max():.2f}"
-                )
-            # Cosine of Spa with Por / Fre / Ron
-            def cos_mean(a, b):
-                an = a / (np.linalg.norm(a, axis=1, keepdims=True) + 1e-12)
-                bn = b / (np.linalg.norm(b, axis=1, keepdims=True) + 1e-12)
-                return float(np.mean(np.sum(an * bn, axis=1)))
-            cos_sp = cos_mean(reps[0], reps[1])
-            cos_sf = cos_mean(reps[0], reps[2])
-            cos_sr = cos_mean(reps[0], reps[4])
-            emit(
-                f"  {model_key}:{pool}:{label}: "
-                f"cos(Spa,Por)={cos_sp:.4f}  cos(Spa,Fre)={cos_sf:.4f}  "
-                f"cos(Spa,Ron)={cos_sr:.4f}"
-            )
-            if cos_sp < 0.5 or cos_sf < 0.5:
-                emit(f"  *** ANOMALY: very low cosine at {label}. Possible numerical issue.")
+    for pool in pools:
+        for lab in labels:
+            norms = []
+            for name in lang_names:
+                X = np.load(out_dir / model_key / pool / lab / f"{name}.npy")
+                norms.append(np.linalg.norm(X, axis=1).mean())
+            emit(f"  {pool}:{lab}: mean per-lang norms "
+                 f"min={min(norms):.2f}  max={max(norms):.2f}  ratio={max(norms)/max(min(norms),1e-9):.2f}")
 
 
-def load_representations(
-    model_key: str,
-    layer_label: str,
-    out_dir: Path,
-    pool: str = "mean_pool",
-) -> list[np.ndarray]:
-    """Return list of 5 arrays in language-index order, shape (n_total, d)."""
-    out_dir = Path(out_dir)
-    arrs = []
-    base = out_dir / model_key
-    # Back-compat: legacy layout had no pooling subdir.
-    legacy = base / layer_label
-    pool_dir = base / pool / layer_label
-    src_dir = pool_dir if pool_dir.exists() else legacy
-    for name in LANG_NAMES:
-        arrs.append(np.load(src_dir / f"{name}.npy"))
-    return arrs
+def load_reps(
+    out_dir: Path, model_key: str, pool: str, layer_label: str,
+    lang_names: list[str],
+) -> dict[str, np.ndarray]:
+    base = Path(out_dir) / model_key / pool / layer_label
+    return {name: np.load(base / f"{name}.npy") for name in lang_names}

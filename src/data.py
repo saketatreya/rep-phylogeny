@@ -1,133 +1,93 @@
-"""Load FLORES-200 parallel sentences for the 5 Romance languages.
+"""Load FLORES-200 devtest sentences for an arbitrary set of languages.
 
-Tries, in order:
-  1. Direct HTTP download of the canonical Meta FLORES-200 tarball (most
-     robust — bypasses HuggingFace entirely, no script/version issues).
-  2. HuggingFace datasets loaders (facebook/flores, openlanguagedata,
-     Muennighoff) — these work only with datasets<4.0 because the older
-     ones are script-based.
+Downloads Meta's canonical NLLB tarball once into ``data_cache/`` and extracts
+the ``devtest/{flores_code}.devtest`` files on demand. No HuggingFace
+dependency — the prior pipeline learned the hard way that the HF loaders for
+FLORES are fragile across ``datasets`` versions.
 """
 from __future__ import annotations
-import io
-import os
 import tarfile
 import urllib.request
 from pathlib import Path
 
-from .config import LANG_CODES, N_TOTAL
+from .config import LANGS, BY_NAME, N_TOTAL
+
 
 FLORES_TAR_URL = "https://dl.fbaipublicfiles.com/nllb/flores200_dataset.tar.gz"
 
 
-def load_flores_sentences(cache_dir: str | Path = "data_cache") -> list[list[str]]:
-    """Return parallel sentences as a list-of-lists indexed [lang][sentence].
-
-    Returns 5 lists of 1012 sentences each in the order
-    [Spanish, Portuguese, French, Italian, Romanian].
-    """
-    cache_dir = Path(cache_dir)
+def _ensure_tarball(cache_dir: Path) -> Path:
+    tar_path = cache_dir / "flores200_dataset.tar.gz"
+    if tar_path.exists():
+        return tar_path
     cache_dir.mkdir(parents=True, exist_ok=True)
-
-    def direct():
-        return _try_direct_download(cache_dir)
-    direct.__name__ = "_try_direct_download"
-    loaders = [
-        direct,
-        _try_facebook_flores,
-        _try_openlanguagedata_flores_plus,
-        _try_muennighoff_flores200,
-    ]
-    last_err = None
-    for fn in loaders:
-        name = fn.__name__
-        try:
-            sents = fn()
-            assert len(sents) == 5, f"got {len(sents)} langs"
-            for i, s in enumerate(sents):
-                assert len(s) == N_TOTAL, f"lang {i}: expected {N_TOTAL}, got {len(s)}"
-            print(f"  [data] loaded via {name}")
-            return sents
-        except Exception as e:
-            last_err = e
-            print(f"  [data] {name} failed: {type(e).__name__}: {e}")
-            continue
-    raise RuntimeError(f"Could not load FLORES from any source. Last error: {last_err}")
+    print(f"  [data] downloading FLORES-200 ({FLORES_TAR_URL}) ...")
+    req = urllib.request.Request(FLORES_TAR_URL,
+                                 headers={"User-Agent": "geneal-rep/1.0"})
+    with urllib.request.urlopen(req, timeout=120) as r, open(tar_path, "wb") as f:
+        while True:
+            chunk = r.read(1024 * 1024)
+            if not chunk:
+                break
+            f.write(chunk)
+    print(f"  [data] downloaded {tar_path.stat().st_size / 1e6:.1f} MB")
+    return tar_path
 
 
-# ---------- preferred: direct download ----------
-
-def _try_direct_download(cache_dir: Path) -> list[list[str]]:
-    """Download Meta's FLORES-200 tarball directly and extract the 5 files."""
-    cached = {code: cache_dir / f"{code}.devtest" for code in LANG_CODES}
-    if not all(p.exists() for p in cached.values()):
-        tar_path = cache_dir / "flores200_dataset.tar.gz"
-        if not tar_path.exists():
-            print(f"  [data] downloading FLORES-200 ({FLORES_TAR_URL}) ...")
-            req = urllib.request.Request(
-                FLORES_TAR_URL,
-                headers={"User-Agent": "rep-phylogeny/1.0"},
+def _extract_one(tar_path: Path, flores_code: str, dest: Path) -> None:
+    target_suffix = f"devtest/{flores_code}.devtest"
+    with tarfile.open(tar_path, mode="r:gz") as tar:
+        member = next(
+            (m for m in tar.getmembers() if m.name.endswith(target_suffix)),
+            None,
+        )
+        if member is None:
+            raise FileNotFoundError(
+                f"FLORES-200 tarball has no entry ending in {target_suffix!r} "
+                f"(language code likely wrong)"
             )
-            with urllib.request.urlopen(req, timeout=120) as r, open(tar_path, "wb") as f:
-                while True:
-                    chunk = r.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-            print(f"  [data] downloaded {tar_path.stat().st_size / 1e6:.1f} MB")
+        f = tar.extractfile(member)
+        if f is None:
+            raise RuntimeError(f"tar entry {member.name} is not a regular file")
+        dest.write_bytes(f.read())
 
-        print(f"  [data] extracting 5 devtest files ...")
-        with tarfile.open(tar_path, mode="r:gz") as tar:
-            for code in LANG_CODES:
-                target = f"devtest/{code}.devtest"
-                member = next(
-                    (m for m in tar.getmembers() if m.name.endswith(target)),
-                    None,
-                )
-                if member is None:
-                    raise FileNotFoundError(f"missing {target} in tarball")
-                f = tar.extractfile(member)
-                cached[code].write_bytes(f.read())
 
-    out = []
-    for code in LANG_CODES:
-        text = cached[code].read_text(encoding="utf-8")
+def load_sentences(
+    lang_names: list[str] | None = None,
+    cache_dir: str | Path = "data_cache",
+) -> dict[str, list[str]]:
+    """Return ``{lang_name: [sentence_0, ..., sentence_1011]}``.
+
+    Sentence indices are parallel across languages (sentence ``i`` in language
+    A is a translation of sentence ``i`` in language B), which is the property
+    every downstream alignment / hub / classifier relies on.
+    """
+    if lang_names is None:
+        lang_names = [L.name for L in LANGS]
+
+    cache_dir = Path(cache_dir)
+    needed = []
+    for name in lang_names:
+        L = BY_NAME[name]
+        dest = cache_dir / f"{L.flores}.devtest"
+        if not dest.exists():
+            needed.append((L, dest))
+
+    if needed:
+        tar_path = _ensure_tarball(cache_dir)
+        print(f"  [data] extracting {len(needed)} devtest file(s) ...")
+        for L, dest in needed:
+            _extract_one(tar_path, L.flores, dest)
+
+    out: dict[str, list[str]] = {}
+    for name in lang_names:
+        L = BY_NAME[name]
+        text = (cache_dir / f"{L.flores}.devtest").read_text(encoding="utf-8")
         lines = [ln for ln in text.split("\n") if ln.strip()]
-        out.append(lines)
-    return out
-
-
-# ---------- HuggingFace fallbacks (require datasets<4.0 for the script ones) ----------
-
-def _try_facebook_flores() -> list[list[str]]:
-    from datasets import load_dataset
-    ds = load_dataset("facebook/flores", "all", split="devtest")
-    return [list(ds[f"sentence_{code}"]) for code in LANG_CODES]
-
-
-def _try_openlanguagedata_flores_plus() -> list[list[str]]:
-    """Non-script HF dataset. Gated — user must request access on HF."""
-    from datasets import load_dataset
-    out = []
-    for code in LANG_CODES:
-        ds = load_dataset("openlanguagedata/flores_plus", code, split="devtest")
-        for col in ("text", "sentence"):
-            if col in ds.column_names:
-                out.append(list(ds[col]))
-                break
-        else:
-            raise KeyError(f"no text column in {ds.column_names}")
-    return out
-
-
-def _try_muennighoff_flores200() -> list[list[str]]:
-    from datasets import load_dataset
-    out = []
-    for code in LANG_CODES:
-        ds = load_dataset("Muennighoff/flores200", code, split="devtest")
-        for col in ("sentence", "text"):
-            if col in ds.column_names:
-                out.append(list(ds[col]))
-                break
-        else:
-            raise KeyError(f"no text column in {ds.column_names}")
+        if len(lines) != N_TOTAL:
+            raise AssertionError(
+                f"{L.flores}.devtest has {len(lines)} non-empty lines, "
+                f"expected {N_TOTAL}"
+            )
+        out[name] = lines
     return out

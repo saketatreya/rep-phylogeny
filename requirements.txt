@@ -1,9 +1,10 @@
 torch>=2.1
 transformers>=4.40
-datasets>=2.18,<4.0
 scipy>=1.11
 numpy>=1.24
 scikit-learn>=1.3
 tqdm>=4.65
 accelerate>=0.27
 sentencepiece>=0.2
+# uroman is optional — only used by the Tier 2d transliteration control.
+# uroman>=1.3
